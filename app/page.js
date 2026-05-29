@@ -1,301 +1,191 @@
-// app/page.js
+// app/backtest/page.js
 "use client";
-import { useState, useEffect, useCallback, useMemo } from "react";
-import { generateSignal, getActiveWindow, SB_WINDOWS } from "@/lib/silverBullet";
-import { computeStats, computePnL, classifyResult } from "@/lib/stats";
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
+import { useState } from "react";
+import { compareRR, parseCSV } from "@/lib/backtest";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, Legend } from "recharts";
 
-const LS_KEY = "sb_gold_trades_v1";
-
-export default function Page() {
-  const [price, setPrice] = useState(null);
+export default function Backtest() {
   const [candles, setCandles] = useState([]);
-  const [signal, setSignal] = useState(null);
-  const [window_, setWindow] = useState(getActiveWindow());
-  const [trades, setTrades] = useState([]);
-  const [ai, setAi] = useState("");
-  const [aiLoading, setAiLoading] = useState(false);
-  const [allowOutside, setAllowOutside] = useState(true);
-  const [status, setStatus] = useState("");
+  const [fileName, setFileName] = useState("");
+  const [results, setResults] = useState(null);
+  const [running, setRunning] = useState(false);
+  const [err, setErr] = useState("");
+  const [onlyWindow, setOnlyWindow] = useState(true);
 
-  // تحميل الصفقات (Supabase أو localStorage احتياطياً)
-  useEffect(() => {
-    (async () => {
-      try {
-        const r = await fetch("/api/trades");
-        const d = await r.json();
-        if (d.ok && !d.local && d.trades) { setTrades(d.trades); return; }
-      } catch {}
-      const local = localStorage.getItem(LS_KEY);
-      if (local) setTrades(JSON.parse(local));
-    })();
-  }, []);
-
-  const persist = useCallback(async (next) => {
-    setTrades(next);
-    localStorage.setItem(LS_KEY, JSON.stringify(next));
-  }, []);
-
-  const saveTrade = useCallback(async (trade) => {
-    try { await fetch("/api/trades", { method: "POST", body: JSON.stringify(trade) }); } catch {}
-  }, []);
-
-  // جلب السعر والشموع
-  const fetchData = useCallback(async () => {
-    setStatus("جاري التحديث...");
+  const onFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setErr(""); setFileName(file.name);
     try {
-      const [pr, cr] = await Promise.all([
-        fetch("/api/metaapi/price?symbol=XAUUSD").then((r) => r.json()),
-        fetch("/api/metaapi/candles?symbol=XAUUSD&tf=5m&limit=100").then((r) => r.json()),
-      ]);
-      if (pr.ok) setPrice(pr);
-      if (cr.ok && cr.candles?.length) {
-        setCandles(cr.candles);
-        setSignal(generateSignal(cr.candles, { allowOutsideWindow: allowOutside, rr: 2 }));
+      const text = await file.text();
+      let data;
+      if (file.name.endsWith(".json")) {
+        data = JSON.parse(text);
       } else {
-        setStatus(cr.error || "تعذّر جلب الشموع — تحقق من إعداد MetaApi");
+        data = parseCSV(text);
       }
-      setStatus("");
-    } catch (e) {
-      setStatus("خطأ في الاتصال: " + e.message);
+      if (!Array.isArray(data) || data.length < 60) {
+        setErr(`الملف يحتوي ${data?.length || 0} شمعة فقط — تحتاج 60 على الأقل`);
+        return;
+      }
+      setCandles(data);
+    } catch (e2) {
+      setErr("تعذّر قراءة الملف: " + e2.message);
     }
-  }, [allowOutside]);
-
-  useEffect(() => {
-    fetchData();
-    const t = setInterval(fetchData, 30000); // كل 30 ثانية
-    const w = setInterval(() => setWindow(getActiveWindow()), 1000);
-    return () => { clearInterval(t); clearInterval(w); };
-  }, [fetchData]);
-
-  const analyzeAI = async () => {
-    if (!signal?.valid) return;
-    setAiLoading(true); setAi("");
-    try {
-      const r = await fetch("/api/ai-analyze", {
-        method: "POST",
-        body: JSON.stringify({ signal, candles }),
-      });
-      const d = await r.json();
-      setAi(d.ok ? d.analysis : "خطأ: " + d.error);
-    } catch (e) { setAi("خطأ: " + e.message); }
-    setAiLoading(false);
   };
 
-  // فتح صفقة من الإشارة
-  const openTrade = () => {
-    if (!signal?.valid) return;
-    const trade = {
-      id: Date.now().toString(),
-      symbol: "XAUUSD",
-      direction: signal.direction,
-      entry: signal.entry,
-      stop: signal.stop,
-      target: signal.target,
-      lots: 0.01,
-      rr: signal.rr,
-      window: signal.window?.name || "—",
-      status: "open",
-      exit: null,
-      openedAt: new Date().toISOString(),
-      closedAt: null,
-    };
-    const next = [trade, ...trades];
-    persist(next); saveTrade(trade);
+  const run = () => {
+    if (candles.length < 60) return;
+    setRunning(true); setResults(null);
+    setTimeout(() => {
+      try {
+        const res = compareRR(candles, [1.5, 2, 3], { warmup: 50, onlyInWindow: onlyWindow });
+        setResults(res);
+      } catch (e) { setErr("خطأ في التشغيل: " + e.message); }
+      setRunning(false);
+    }, 50);
   };
 
-  const closeTrade = (id, exitPrice) => {
-    const next = trades.map((t) =>
-      t.id === id ? { ...t, status: "closed", exit: parseFloat(exitPrice), closedAt: new Date().toISOString() } : t
-    );
-    persist(next);
-    const t = next.find((x) => x.id === id);
-    if (t) saveTrade(t);
-  };
+  // دمج منحنيات رأس المال الثلاثة في رسم واحد
+  const mergedCurve = results ? (() => {
+    const maxLen = Math.max(...results.map((r) => r.equityCurve.length), 0);
+    const arr = [];
+    for (let i = 0; i < maxLen; i++) {
+      const row = { x: i + 1 };
+      results.forEach((r) => { row["rr" + r.rr] = r.equityCurve[i]?.y ?? null; });
+      arr.push(row);
+    }
+    return arr;
+  })() : [];
 
-  const closeAtTarget = (id) => { const t = trades.find(x=>x.id===id); if(t) closeTrade(id, t.target); };
-  const closeAtStop = (id) => { const t = trades.find(x=>x.id===id); if(t) closeTrade(id, t.stop); };
-
-  const delTrade = (id) => {
-    const next = trades.filter((t) => t.id !== id);
-    persist(next);
-    fetch(`/api/trades?id=${id}`, { method: "DELETE" }).catch(()=>{});
-  };
-
-  const stats = useMemo(() => computeStats(trades), [trades]);
-  const openTrades = trades.filter((t) => t.status === "open");
-  const closedTrades = trades.filter((t) => t.status === "closed");
+  const colors = { "rr1.5": "#00d4ff", "rr2": "#d4af37", "rr3": "#2dd4a7" };
+  const best = results ? [...results].sort((a, b) => b.totalPnL - a.totalPnL)[0] : null;
 
   return (
     <div className="wrap">
-      {/* Header */}
       <div className="topbar">
         <div className="brand">
-          <div className="logo">SB</div>
+          <div className="logo">BT</div>
           <div>
-            <h1>Silver Bullet Gold</h1>
-            <p>XAU/USD · ICT Strategy System</p>
+            <h1>الاختبار الرجعي — Walk-Forward</h1>
+            <p>XAU/USD · يرى الماضي فقط، لا يعرف الشمعة القادمة</p>
           </div>
         </div>
-        <div className="price-pill">
-          <span className="lbl">XAU/USD</span>
-          {price ? price.mid.toFixed(2) : "—"}
-        </div>
+        <a href="/" className="btn btn-ghost" style={{ textDecoration: "none" }}>← اللوحة</a>
       </div>
 
-      <div style={{ marginBottom: 16, display: "flex", gap: 10, flexWrap: "wrap" }}>
-        <a href="/guide" className="btn btn-ghost" style={{ textDecoration: "none", display: "inline-block" }}>
-          📚 الدليل التعليمي — كيف تعمل Silver Bullet على الذهب
-        </a>
-        <a href="/backtest" className="btn btn-ghost" style={{ textDecoration: "none", display: "inline-block" }}>
-          🔬 الاختبار الرجعي (Backtest) — قارن نسب R:R على بياناتك التاريخية
-        </a>
-      </div>
-
-      {/* Window banner */}
-      <div className={`window-banner ${window_.active ? "active" : ""}`}>
-        <span className={`dot ${window_.active ? "live" : ""}`} />
-        {window_.active ? (
-          <span><b>{window_.name}</b> نشطة الآن — متبقٍ {window_.minutesLeft} دقيقة</span>
-        ) : (
-          <span>خارج النوافذ — التالية: <b>{window_.nextWindow?.name}</b> بعد ~{window_.hoursUntilNext?.toFixed(1)} ساعة</span>
-        )}
-        <span className="muted" style={{ marginInlineStart: "auto" }}>
-          {SB_WINDOWS.map((w) => w.label).join("  ·  ")}
-        </span>
-      </div>
-
-      {status && <div className="card" style={{ borderColor: "var(--red)", color: "var(--red)" }}>{status}</div>}
-
-      <div className="grid">
-        {/* LEFT */}
-        <div>
-          {/* Signal */}
-          <div className="card">
-            <h2>الإشارة الحالية <span className="tag">تحديث كل 30 ثانية</span></h2>
-            {signal?.valid ? (
-              <div className={`signal ${signal.direction}`}>
-                <div className={`sig-dir ${signal.direction}`}>
-                  {signal.direction === "buy" ? "▲ شراء BUY" : "▼ بيع SELL"}
-                </div>
-                <p className="muted" style={{ marginTop: 6 }}>{signal.reason}</p>
-                <div className="levels">
-                  <div className="level"><div className="l">الدخول</div><div className="v" style={{color:"var(--blue)"}}>{signal.entry}</div></div>
-                  <div className="level"><div className="l">وقف الخسارة</div><div className="v" style={{color:"var(--red)"}}>{signal.stop}</div></div>
-                  <div className="level"><div className="l">الهدف</div><div className="v" style={{color:"var(--green)"}}>{signal.target}</div></div>
-                </div>
-                <div style={{ display:"flex", gap:14, margin:"12px 2px", fontSize:13 }}>
-                  <span className="muted">R:R = <b style={{color:"var(--gold-bright)"}}>1:{signal.rr}</b></span>
-                  <span className="muted">الهيكل: <b>{signal.structure?.trend}</b></span>
-                </div>
-                <div className="btn-row">
-                  <button className="btn btn-gold" onClick={openTrade}>فتح صفقة بهذه المستويات</button>
-                  <button className="btn btn-ghost" onClick={analyzeAI} disabled={aiLoading}>
-                    {aiLoading ? "...يحلل" : "🤖 تحليل AI"}
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="signal none">
-                <p>{signal?.reason || "بانتظار البيانات..."}</p>
-              </div>
-            )}
-            {ai && <div className="ai-box" style={{ marginTop: 14 }}>{ai}</div>}
-          </div>
-
-          {/* Equity curve */}
-          <div className="card">
-            <h2>منحنى رأس المال <span className="tag">Equity Curve</span></h2>
-            {stats.equityCurve.length ? (
-              <ResponsiveContainer width="100%" height={220}>
-                <LineChart data={stats.equityCurve}>
-                  <XAxis dataKey="x" stroke="#7d8aa0" fontSize={11} />
-                  <YAxis stroke="#7d8aa0" fontSize={11} />
-                  <Tooltip contentStyle={{ background:"#161d29", border:"1px solid #1f2937", borderRadius:10 }} />
-                  <ReferenceLine y={0} stroke="#7d8aa0" strokeDasharray="3 3" />
-                  <Line type="monotone" dataKey="y" stroke="#d4af37" strokeWidth={2} dot={false} />
-                </LineChart>
-              </ResponsiveContainer>
-            ) : <p className="muted">لا توجد صفقات مغلقة بعد لعرض المنحنى</p>}
-          </div>
-        </div>
-
-        {/* RIGHT */}
-        <div>
-          {/* Stats */}
-          <div className="card">
-            <h2>إحصائيات الأداء</h2>
-            <div className="stats">
-              <div className="stat"><div className="v gold">{stats.winRate}%</div><div className="l">Win Rate</div></div>
-              <div className="stat"><div className={`v ${stats.totalPnL>=0?"green":"red"}`}>{stats.totalPnL}$</div><div className="l">صافي الربح</div></div>
-              <div className="stat"><div className="v">{stats.totalTrades}</div><div className="l">صفقات مغلقة</div></div>
-              <div className="stat"><div className="v green">{stats.wins}</div><div className="l">رابحة</div></div>
-              <div className="stat"><div className="v red">{stats.losses}</div><div className="l">خاسرة</div></div>
-              <div className="stat"><div className="v gold">{stats.profitFactor}</div><div className="l">Profit Factor</div></div>
-              <div className="stat"><div className="v">{stats.avgWin}$</div><div className="l">متوسط الربح</div></div>
-              <div className="stat"><div className="v">{stats.avgLoss}$</div><div className="l">متوسط الخسارة</div></div>
-              <div className="stat"><div className="v">{stats.expectancy}$</div><div className="l">التوقع/صفقة</div></div>
-            </div>
-          </div>
-
-          {/* Open trades */}
-          <div className="card">
-            <h2>الصفقات المفتوحة <span className="tag">{openTrades.length}</span></h2>
-            {openTrades.length ? openTrades.map((t) => (
-              <div key={t.id} style={{ padding:12, background:"var(--panel-2)", borderRadius:10, marginBottom:8 }}>
-                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-                  <span className={`sig-dir ${t.direction}`} style={{ fontSize:15 }}>
-                    {t.direction === "buy" ? "▲ شراء" : "▼ بيع"} @ {t.entry}
-                  </span>
-                  <span className="badge open">مفتوحة</span>
-                </div>
-                <div className="muted" style={{ fontSize:11, margin:"6px 0", fontFamily:"var(--mono)" }}>
-                  SL {t.stop} · TP {t.target} · {t.lots} lot
-                </div>
-                <div className="btn-row">
-                  <button className="btn btn-green" style={{padding:"7px 12px",fontSize:12}} onClick={()=>closeAtTarget(t.id)}>أغلق على الهدف</button>
-                  <button className="btn btn-red" style={{padding:"7px 12px",fontSize:12}} onClick={()=>closeAtStop(t.id)}>أغلق على الوقف</button>
-                </div>
-              </div>
-            )) : <p className="muted">لا توجد صفقات مفتوحة</p>}
-          </div>
-        </div>
-      </div>
-
-      {/* History */}
+      {/* رفع الملف */}
       <div className="card">
-        <h2>سجل الصفقات <span className="tag">{closedTrades.length} صفقة</span></h2>
-        {closedTrades.length ? (
-          <div style={{ overflowX:"auto" }}>
-            <table>
-              <thead><tr>
-                <th>الاتجاه</th><th>دخول</th><th>خروج</th><th>النتيجة</th><th>الربح/الخسارة</th><th>التاريخ</th><th></th>
-              </tr></thead>
-              <tbody>
-                {closedTrades.map((t) => {
-                  const pnl = computePnL(t);
-                  const res = classifyResult(t);
-                  return (
-                    <tr key={t.id}>
-                      <td><span className={`sig-dir ${t.direction}`} style={{fontSize:13}}>{t.direction==="buy"?"▲":"▼"}</span></td>
-                      <td>{t.entry}</td><td>{t.exit}</td>
-                      <td><span className={`badge ${res}`}>{res==="win"?"ربح":res==="loss"?"خسارة":"تعادل"}</span></td>
-                      <td style={{ color: pnl>=0?"var(--green)":"var(--red)" }}>{pnl>=0?"+":""}{pnl}$</td>
-                      <td className="muted" style={{fontSize:11}}>{new Date(t.closedAt).toLocaleDateString("ar")}</td>
-                      <td><button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:11}} onClick={()=>delTrade(t.id)}>حذف</button></td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+        <h2>1) ارفع بيانات الذهب التاريخية <span className="tag">CSV أو JSON · فريم 5 دقائق</span></h2>
+        <div className="row2" style={{ alignItems: "end" }}>
+          <div className="field" style={{ marginBottom: 0 }}>
+            <label>ملف البيانات (time,open,high,low,close,volume)</label>
+            <input type="file" accept=".csv,.json,.txt" onChange={onFile} />
           </div>
-        ) : <p className="muted">لا توجد صفقات مغلقة في السجل بعد</p>}
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <label style={{ margin: 0, display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
+              <input type="checkbox" checked={onlyWindow} onChange={(e) => setOnlyWindow(e.target.checked)} style={{ width: "auto" }} />
+              التزام نوافذ Silver Bullet فقط
+            </label>
+          </div>
+        </div>
+        {fileName && <p className="muted" style={{ marginTop: 10 }}>✓ {fileName} — {candles.length} شمعة محمّلة{candles.length ? ` (${candles[0].time} → ${candles[candles.length-1].time})` : ""}</p>}
+        {err && <p style={{ color: "var(--red)", marginTop: 10 }}>{err}</p>}
+        <button className="btn btn-gold" style={{ marginTop: 14 }} disabled={candles.length < 60 || running} onClick={run}>
+          {running ? "...يُشغّل الاختبار" : "▶ شغّل المقارنة (1:1.5 · 1:2 · 1:3)"}
+        </button>
       </div>
+
+      {results && (
+        <>
+          {/* جدول المقارنة */}
+          <div className="card">
+            <h2>2) مقارنة نسب المخاطرة/العائد</h2>
+            <div style={{ overflowX: "auto" }}>
+              <table>
+                <thead><tr>
+                  <th>R:R</th><th>صفقات</th><th>Win Rate</th><th>رابحة</th><th>خاسرة</th>
+                  <th>لم تُغلق</th><th>صافي $</th><th>PF</th><th>توقع $</th><th>أقصى تراجع</th>
+                </tr></thead>
+                <tbody>
+                  {results.map((r) => (
+                    <tr key={r.rr} style={best?.rr === r.rr ? { background: "rgba(212,175,55,0.08)" } : {}}>
+                      <td style={{ color: "var(--gold-bright)", fontWeight: 700 }}>1:{r.rr}{best?.rr===r.rr?" ⭐":""}</td>
+                      <td>{r.totalTrades}</td>
+                      <td style={{ color: r.winRate >= 50 ? "var(--green)" : "var(--red)" }}>{r.winRate}%</td>
+                      <td style={{ color: "var(--green)" }}>{r.wins}</td>
+                      <td style={{ color: "var(--red)" }}>{r.losses}</td>
+                      <td className="muted">{r.timeouts}</td>
+                      <td style={{ color: r.totalPnL >= 0 ? "var(--green)" : "var(--red)" }}>{r.totalPnL >= 0 ? "+" : ""}{r.totalPnL}</td>
+                      <td style={{ color: "var(--gold-bright)" }}>{r.profitFactor}</td>
+                      <td>{r.expectancy}</td>
+                      <td style={{ color: "var(--red)" }}>-{r.maxDrawdown}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {best && (
+              <p className="muted" style={{ marginTop: 14, lineHeight: 1.8 }}>
+                ⭐ الأفضل بصافي الربح: <b style={{ color: "var(--gold-bright)" }}>R:R 1:{best.rr}</b> —
+                لكن انتبه: Win Rate الأعلى ليس دائماً الأربح. وازن بين معدل الفوز وصافي الربح وأقصى تراجع.
+                {" "}<b>"لم تُغلق"</b> = صفقات لم تلمس الهدف أو الوقف خلال المدة (لا تُحسب في Win Rate).
+              </p>
+            )}
+          </div>
+
+          {/* منحنيات رأس المال */}
+          <div className="card">
+            <h2>3) منحنيات رأس المال المقارنة</h2>
+            <ResponsiveContainer width="100%" height={300}>
+              <LineChart data={mergedCurve}>
+                <XAxis dataKey="x" stroke="#7d8aa0" fontSize={11} label={{ value: "رقم الصفقة", position: "insideBottom", offset: -2, fill: "#7d8aa0", fontSize: 11 }} />
+                <YAxis stroke="#7d8aa0" fontSize={11} label={{ value: "الربح التراكمي $", angle: -90, position: "insideLeft", fill: "#7d8aa0", fontSize: 11 }} />
+                <Tooltip contentStyle={{ background: "#161d29", border: "1px solid #1f2937", borderRadius: 10 }} />
+                <Legend />
+                <ReferenceLine y={0} stroke="#7d8aa0" strokeDasharray="3 3" />
+                {results.map((r) => (
+                  <Line key={r.rr} type="monotone" dataKey={"rr" + r.rr} name={`R:R 1:${r.rr}`} stroke={colors["rr" + r.rr]} strokeWidth={2} dot={false} connectNulls />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+
+          {/* سجل صفقات الأفضل */}
+          {best && (
+            <div className="card">
+              <h2>4) صفقات السيناريو الأفضل (R:R 1:{best.rr}) <span className="tag">{best.trades.length} صفقة</span></h2>
+              <div style={{ overflowX: "auto", maxHeight: 400, overflowY: "auto" }}>
+                <table>
+                  <thead><tr>
+                    <th>#</th><th>الوقت</th><th>اتجاه</th><th>دخول</th><th>خروج</th><th>نتيجة</th><th>شموع</th><th>$</th>
+                  </tr></thead>
+                  <tbody>
+                    {best.trades.map((t, i) => (
+                      <tr key={i}>
+                        <td className="muted">{i + 1}</td>
+                        <td className="muted" style={{ fontSize: 11 }}>{new Date(t.time).toLocaleString("ar", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</td>
+                        <td><span className={`sig-dir ${t.direction}`} style={{ fontSize: 13 }}>{t.direction === "buy" ? "▲" : "▼"}</span></td>
+                        <td>{t.entry}</td><td>{t.exit?.toFixed(2)}</td>
+                        <td><span className={`badge ${t.outcome === "win" ? "win" : t.outcome === "loss" ? "loss" : "be"}`}>
+                          {t.outcome === "win" ? "ربح" : t.outcome === "loss" ? "خسارة" : "لم تُغلق"}
+                        </span></td>
+                        <td className="muted">{t.bars}</td>
+                        <td style={{ color: t.pnl >= 0 ? "var(--green)" : "var(--red)" }}>{t.pnl >= 0 ? "+" : ""}{t.pnl}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </>
+      )}
 
       <p className="disclaimer">
-        ⚠️ هذا النظام لأغراض تعليمية وتنظيمية فقط وليس نصيحة مالية أو استثمارية.
-        التداول بالرافعة المالية على الذهب يحمل مخاطر خسارة عالية قد تتجاوز رأس المال.
-        الإشارات الآلية لا تضمن الربح — اختبر دائماً على حساب تجريبي أولاً وأدِر مخاطرك بمسؤولية.
+        ⚠️ الاختبار الرجعي walk-forward يحاكي التداول دون رؤية المستقبل، لكنه لا يضمن نتائج مستقبلية.
+        الأداء التاريخي لا يعكس الأداء القادم. النموذج تحفّظي (يفترض لمس الوقف قبل الهدف عند التعارض داخل الشمعة).
+        لا يشمل الانزلاق السعري (slippage) أو العمولات أو السبريد الحقيقي. للأغراض التعليمية فقط — ليس نصيحة مالية.
       </p>
     </div>
   );
